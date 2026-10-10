@@ -1,0 +1,221 @@
+# Jura v22.20.9 dashboard
+# Entity IDs use the user's Kitchen-prefixed Home Assistant registry names.
+
+title: Kitchen Jura
+views:
+  - title: Jura
+    path: jura
+    icon: mdi:coffee-maker
+    cards:
+      - type: markdown
+        content: |
+          ## Jura
+          Select an **Operation**, set **Repeats**, then press **Start Operation**.
+          Beverage batches advance only after the mapped lifetime counter proves
+          that the preceding product completed. The delay before the next product is
+          configurable. Operation/Repeats and Grinder have separate configurable
+          reset timers. Set either timeout to `0`
+          to disable that reset. Grinder timeout returns it to `Default`.
+
+          **Grinder:** the machine's RAM `0x05` state is now authoritative:
+          `0=Default`, `1=Left`, `2=Right (Decaf)`, `3=Both`. Before each
+          grinder-using product, ESPHome reads the current state, presses whichever
+          physical Recipe button is currently assigned `Grinder Selector` (`0x12`),
+          re-reads `0x05`, and will not brew unless the requested grinder is verified.
+          If no button is assigned `0x12`, the Grinder select is reduced to `Default`
+          only; reconnect Home Assistant to ESPHome after a remap if its options are stale.
+
+          **Status:** each mapped EEPROM-counter refresh is preceded by `RR:00`.
+          RAM `0x0E` drives tray, grounds-bin, and water/tank-float warnings;
+          provisional RAM `0x07` drives left/right Fill Beans warnings.
+
+          **Maintenance:** Rinse, Clean Coffee, Decalcifying, and Clean Milk System
+          are available from the production Operation dropdown.
+
+          **Research:** debug controls are hidden from Home Assistant by default.
+          Set `hide_debug_tools: "false"` in ESPHome and recompile to expose the
+          separate Debug Operation selector, experiments/dumps, and raw-command tools.
+          `Top-Level Menu RAM Discovery` maps the top-level ring. `Menu Section RAM Discovery` runs the selected bounded `Menu Discovery Section`; `Full Menu RAM Discovery` walks the complete graph. Menu discovery is RAM-only in v22.19.3: editable states are automatically probed +1 then -1 without saving the changed value; EEPROM is not read or written. Persistent EEPROM discovery will be added only after repeated RAM captures provide deterministic state signatures. `Clock/Timer Mapping` uses four snapshots and `Experiment Window (clock timeline only)`. Enter visible LCD values, bar-graph positions, lamp observations, or other notes in `Debug Operator Observation`; every accepted Continue logs and clears the field. Generic RAM/EEPROM experiments remain operator-paced.
+
+      - type: entities
+        title: Control
+        show_header_toggle: false
+        entities:
+          - entity: switch.kitchen_jura_power
+            name: Power
+          - entity: binary_sensor.kitchen_jura_jura_powered_on
+            name: Powered On
+          - entity: text_sensor.kitchen_jura_operation_status
+            name: Operation Status
+          - entity: select.kitchen_jura_operation
+            name: Operation
+          - entity: select.kitchen_jura_grinder
+            name: Grinder
+          - entity: number.kitchen_jura_operation_repeats
+            name: Repeats
+          - entity: button.kitchen_jura_start_operation
+            name: Start
+          - entity: button.kitchen_jura_cancel_operation
+            name: Cancel
+
+      # Visible only when hide_debug_tools is false in ESPHome. Adjust entity IDs
+      # if your Home Assistant device prefix differs.
+      - type: entities
+        title: Discovery / Debug
+        show_header_toggle: false
+        entities:
+          - entity: select.kitchen_jura_debug_operation
+            name: Debug Operation
+          - entity: select.kitchen_jura_menu_discovery_section
+            name: Menu Discovery Section
+          - entity: number.kitchen_jura_experiment_window
+            name: Experiment Window (clock only)
+          - entity: button.kitchen_jura_start_debug_operation
+            name: Start Debug
+          - entity: text.kitchen_jura_debug_operator_observation
+            name: Operator Observation (logged on Continue)
+          - entity: button.kitchen_jura_continue_debug_operation
+            name: Continue Debug Operation
+          - entity: button.kitchen_jura_cancel_operation
+            name: Cancel
+          - entity: text_sensor.kitchen_jura_jura_ram_changes
+            name: RAM Changes
+          - entity: text_sensor.kitchen_jura_jura_eeprom_changes
+            name: EEPROM Changes
+
+      - type: markdown
+        title: Panel buttons
+        content: |
+          ESPHome exposes **Press Program**, **Press Exit**, **Press -**, and **Press +**
+          as direct button entities. Add them here using the entity IDs assigned by
+          your Home Assistant registry. `FA:0F` exits logically, but the Jura LCD
+          does not redraw when that command is sent directly.
+
+      - type: entities
+        title: Machine Alerts
+        show_header_toggle: false
+        entities:
+          - entity: binary_sensor.kitchen_jura_drip_tray_missing
+            name: Drip Tray Missing
+          - entity: binary_sensor.kitchen_jura_grounds_bin_missing
+            name: Grounds Bin Missing
+          - entity: binary_sensor.kitchen_jura_fill_water_tank_float
+            name: Fill Water / Tank Float
+          - entity: binary_sensor.kitchen_jura_fill_beans_left
+            name: Fill Beans Left
+          - entity: binary_sensor.kitchen_jura_fill_beans_right
+            name: Fill Beans Right
+
+      - type: entities
+        title: Jura Configuration
+        show_header_toggle: false
+        entities:
+          - entity: number.kitchen_jura_inter_product_delay
+            name: Inter-Product Delay
+          - entity: number.kitchen_jura_operation_reset_timeout
+            name: Operation Reset Timeout
+          - entity: number.kitchen_jura_grinder_override_timeout
+            name: Grinder Override Timeout
+          - entity: number.kitchen_jura_counter_poll_interval
+            name: Counter Poll Interval
+          - entity: switch.kitchen_jura_automatic_jura_polling
+            name: Automatic Jura Polling
+          - entity: switch.kitchen_jura_recipe_eeprom_writes
+            name: Recipe EEPROM Writes
+          - entity: select.kitchen_jura_operation
+            name: Recipe / Operation
+          - entity: select.kitchen_jura_recipe_editor_function
+            name: Recipe Editor Function
+          - entity: select.kitchen_jura_recipe_editor_preset
+            name: Recipe Editor Preset
+
+
+      - type: entities
+        title: Scheduling
+        show_header_toggle: false
+        entities:
+          - entity: number.kitchen_jura_auto_off_delay
+            name: Auto-Off Delay (0 = Disabled)
+          - entity: switch.kitchen_jura_scheduled_power_on
+            name: Scheduled Power On
+          - entity: time.kitchen_jura_scheduled_power_on_time
+            name: Power On Time
+          - entity: switch.kitchen_jura_power_on_monday
+            name: Monday
+          - entity: switch.kitchen_jura_power_on_tuesday
+            name: Tuesday
+          - entity: switch.kitchen_jura_power_on_wednesday
+            name: Wednesday
+          - entity: switch.kitchen_jura_power_on_thursday
+            name: Thursday
+          - entity: switch.kitchen_jura_power_on_friday
+            name: Friday
+          - entity: switch.kitchen_jura_power_on_saturday
+            name: Saturday
+          - entity: switch.kitchen_jura_power_on_sunday
+            name: Sunday
+          - entity: switch.kitchen_jura_scheduled_power_off
+            name: Scheduled Power Off
+          - entity: time.kitchen_jura_scheduled_power_off_time
+            name: Power Off Time
+
+      - type: markdown
+        content: |
+          **Scheduling EEPROM:** power-on time is `0x25`, auto-off is `0x26`,
+          power-off time is `0x28`, and power-on weekdays are `0x57` bits 0–6.
+          `0x8000` means a scheduled on/off time is disabled. Setting a time
+          directly enables that schedule; schedule writes are read-back verified.
+
+      - type: markdown
+        content: |
+          ## Recipe/action slots
+          `D4..FB` contains ten fixed recipe/action slots. **Function** and **Preset**
+          are intentionally independent. Function changes only the action/type byte;
+          Preset changes the parameter profile while preserving the function. This
+          allows combinations such as an Espresso function with Coffee water/strength.
+          Manual parameter edits make the Preset state `Custom`. **Recipe EEPROM Writes**
+          must be ON before either type of EEPROM edit is accepted and resets OFF at
+          reboot. `0x1A..0x1C` are intentionally not offered because they wedged Product Settings.
+
+      - type: entities
+        title: Recipe Editor
+        show_header_toggle: false
+        entities:
+          - select.kitchen_jura_operation
+          - select.kitchen_jura_recipe_editor_function
+          - select.kitchen_jura_recipe_editor_preset
+          - number.kitchen_jura_recipe_editor_temperature
+          - number.kitchen_jura_recipe_editor_grinder_balance
+          - number.kitchen_jura_recipe_editor_powder_raw
+          - number.kitchen_jura_recipe_editor_water
+          - number.kitchen_jura_recipe_editor_milk
+          - number.kitchen_jura_recipe_editor_froth
+
+      - type: markdown
+        content: |
+          The ESP8266 keeps all ten recipe slots cached internally, but only the
+          selected slot is exposed through the editor entities to preserve heap.
+          Changing **Operation** to one of the first ten recipe entries immediately refreshes Function, Preset,
+          and all six parameters from that slot. The same Operation entity is used for
+          both editing and Start Operation; its first ten choices are the physical recipe slots.
+
+
+      - type: markdown
+        title: Lifetime & Service Counters
+        content: |
+          | Counter | Value |
+          |:--|--:|
+          | Coffee | {{ states('sensor.kitchen_jura_lifetime_coffee') }} |
+          | Espresso | {{ states('sensor.kitchen_jura_lifetime_espresso') }} |
+          | Cappuccino | {{ states('sensor.kitchen_jura_lifetime_cappuccino') }} |
+          | Latte Macchiato | {{ states('sensor.kitchen_jura_lifetime_latte_macchiato') }} |
+          | Macchiato | {{ states('sensor.kitchen_jura_lifetime_macchiato') }} |
+          | Milk Froth | {{ states('sensor.kitchen_jura_lifetime_milk_froth') }} |
+          | Hot Water | {{ states('sensor.kitchen_jura_lifetime_hot_water') }} |
+          | Steam | {{ states('sensor.kitchen_jura_lifetime_steam') }} |
+          | Rinse | {{ states('sensor.kitchen_jura_lifetime_rinse') }} |
+          | Clean Cappu | {{ states('sensor.kitchen_jura_lifetime_clean_cappu') }} |
+          | Cleaning Cycles | {{ states('sensor.kitchen_jura_lifetime_cleaning_cycles') }} |
+          | Descaling Cycles | {{ states('sensor.kitchen_jura_lifetime_descaling_cycles') }} |
+          | Filter Changes | {{ states('sensor.kitchen_jura_lifetime_filter_changes') }} |
+          | Power On / Wake | {{ states('sensor.kitchen_jura_lifetime_power_on_wake') }} |

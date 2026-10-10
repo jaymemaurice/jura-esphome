@@ -1,0 +1,1178 @@
+substitutions:
+  device_name: jura
+  friendly_name: Jura
+  # ESPHome cannot reliably add/remove HA entities at runtime. Set this false
+  # before compiling when research controls should be exposed to Home Assistant.
+  hide_debug_tools: "true"
+  # SNTP is used for syslog timestamps only. Clock/Timer Mapping uses relative millis().
+  local_timezone: "America/Toronto"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Register the existing template Grinder select after the Jura component has
+  # loaded. Its options are then reduced to Default-only until a live recipe
+  # slot is observed with function 0x12 (Grinder Selector). If that assignment
+  # changes later, Home Assistant may need to reconnect to refresh select traits.
+  on_boot:
+    - priority: 550.0
+      then:
+        - lambda: |-
+            id(jura_machine).register_grinder_select(*id(jura_grinder));
+
+# Core-only build: no HTTP server and no embedded visualizer.
+
+esp8266:
+  board: esp12e
+
+# GPIO1/GPIO3 are UART0 on ESP8266. Serial logging must remain disabled because
+# the Jura service port owns this UART.
+logger:
+  baud_rate: 0
+  # High-volume UART TX/RX still reaches the built-in web log directly.
+  # INFO removes DEBUG format strings/call sites from the firmware.
+  level: INFO
+  logs:
+    jura: INFO
+    jura.discovery: INFO
+
+# Persist logs off-device without wearing ESP flash.
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${local_timezone}
+
+udp:
+  id: syslog_udp
+  addresses:
+    - !secret jura_syslog_address
+
+syslog:
+  udp_id: syslog_udp
+  time_id: sntp_time
+  port: 514
+  facility: 16
+  level: INFO
+  strip: true
+
+api:
+  # This ESP8266 exposes many EEPROM-backed entities. A single mapped recipe
+  # page can initialize more states than the native API's small default send
+  # queue, so batch state traffic and leave enough queue headroom for bursts.
+  # ESP8266 has very little free heap. Keep the API queue deliberately small
+  # and drain it quickly; a large delayed queue was observed in Soft-WDT
+  # backtraces inside APIOverflowBuffer. A stalled log client should be dropped
+  # rather than allowed to consume enough RAM/CPU to destabilize the device.
+  batch_delay: 50ms
+  max_connections: 2
+  max_send_queue: 5
+  encryption:
+    key: !secret jura_api_key
+  on_client_connected:
+    - logger.log:
+        level: INFO
+        format: "API client connected: %s (%s)"
+        args: ["client_info.c_str()", "client_address.c_str()"]
+  on_client_disconnected:
+    - logger.log:
+        level: WARN
+        format: "API client disconnected: %s (%s)"
+        args: ["client_info.c_str()", "client_address.c_str()"]
+
+ota:
+  - platform: esphome
+    password: !secret jura_ota_password
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 10
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 5
+  fast_connect: true
+  post_connect_roaming: false
+  power_save_mode: none
+  on_connect:
+    - logger.log:
+        level: INFO
+        format: "WiFi connected"
+  on_disconnect:
+    - logger.log:
+        level: WARN
+        format: "WiFi disconnected"
+  ap:
+    ssid: "Jura Fallback Hotspot"
+    password: !secret jura_fallback_password
+
+safe_mode:
+  num_attempts: 5
+
+debug:
+  update_interval: 60s
+
+# IMPORTANT: jura.yaml and components/jura must come from the same release.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [jura]
+
+uart:
+  id: jura_uart
+  tx_pin: GPIO1
+  rx_pin:
+    number: GPIO3
+    inverted: false
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+jura:
+  id: jura_machine
+  uart_id: jura_uart
+  time_id: sntp_time
+
+  # Production state polling. No periodic IC: command is sent.
+  power_poll_interval: 30s
+  ready_poll_interval: 5s
+
+  inter_character_delay: 8ms
+  command_timeout: 5s
+  startup_delay: 2s
+  query_machine_type: true
+
+  discovery:
+    eeprom:
+      start_address: 0x00
+      end_address: 0xF0
+      step: 0x10
+      address_width: 2
+    ram:
+      start_address: 0x00
+      end_address: 0xF0
+      step: 0x10
+      address_width: 2
+
+  # Product/action commands are physical recipe slots, not fixed beverages.
+  # EEPROM D4..FB assigns each slot's function. Factory/default mapping:
+  #   Recipe 1=Coffee, 2=Espresso, 3=Grinder Selector, 4=2x,
+  #   5=Cappuccino, 6=Latte Macchiato, 7=Macchiato, 8=Milk Froth,
+  #   9=Hot Water, 10=Steam.
+  # Recipe 1..8 are FA:01..FA:08; Recipe 9 is FA:00; Recipe 10 is FA:09.
+  commands:
+    power_on: "AN:01"
+    power_off: "AN:02"
+    recipe_1: "FA:01"
+    recipe_2: "FA:02"
+    recipe_3:
+      command: "FA:03"
+      repeat: 1
+      repeat_delay: 1s
+    recipe_4: "FA:04"
+    recipe_5: "FA:05"
+    recipe_6: "FA:06"
+    recipe_7: "FA:07"
+    recipe_8: "FA:08"
+    recipe_9: "FA:00"
+    recipe_10: "FA:09"
+    program_settings: "FA:0A"
+    rinse: "FA:0B"
+    clean_coffee: "FA:0C"
+    decalcifying: "FA:0D"
+    clean_milk_system: "FA:0E"
+    exit: "FA:0F"
+    minus: "FA:10"
+    plus: "FA:11"
+
+# Operation/repeat and grinder are separate UI overrides with independent,
+# persistent timeout configuration. A timeout of 0 disables automatic reset.
+globals:
+  - id: operation_reset_in_progress
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: grinder_reset_in_progress
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+script:
+  # Sliding Operation/Repeats timeout. Operation/Repeats changes and Start
+  # restart it. 0 minutes disables automatic reset.
+  - id: reset_operation_controls_timer
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(operation_reset_timeout).state > 0.0f;'
+          then:
+            - delay: !lambda |-
+                return static_cast<uint32_t>(id(operation_reset_timeout).state * 60000.0f);
+            - lambda: |-
+                id(operation_reset_in_progress) = true;
+            - lambda: |-
+                auto call = id(jura_operation).make_call();
+                call.set_index(0);
+                call.perform();
+            - number.set:
+                id: operation_repeats
+                value: 1
+            - lambda: |-
+                id(operation_reset_in_progress) = false;
+                ESP_LOGI("jura", "OPERATION_UI: timeout -> slot 1 Repeats=1");
+
+  # Independent grinder-override timeout. It is armed only for a non-Default
+  # grinder selection; 0 minutes disables it. Start also refreshes the timer.
+  # The batch engine captures its requested grinder at Start, so a later UI
+  # timeout does not mutate the active operation.
+  - id: reset_grinder_override_timer
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(grinder_override_timeout).state > 0.0f &&
+                     id(jura_grinder).current_option() != "Default";
+          then:
+            - delay: !lambda |-
+                return static_cast<uint32_t>(id(grinder_override_timeout).state * 60000.0f);
+            - lambda: |-
+                id(grinder_reset_in_progress) = true;
+            - select.set:
+                id: jura_grinder
+                option: "Default"
+            - lambda: |-
+                id(grinder_reset_in_progress) = false;
+                ESP_LOGI("jura", "GRINDER_UI: override timeout -> Grinder=Default");
+
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+  - platform: jura
+    jura_id: jura_machine
+    communication:
+      name: "Jura Communication"
+    powered_on:
+      id: jura_powered_on
+      name: "Jura Powered On"
+    tray_missing:
+      name: "Drip Tray Missing"
+    grounds_bin_missing:
+      name: "Grounds Bin Missing"
+    fill_tank:
+      name: "Fill Water / Tank Float"
+    fill_beans_left:
+      name: "Fill Beans Left"
+    fill_beans_right:
+      name: "Fill Beans Right"
+    light_recipe_1:
+      name: "Recipe 1 Light Active"
+    light_recipe_2:
+      name: "Recipe 2 Light Active"
+    light_recipe_3:
+      name: "Recipe 3 Light Active"
+    light_recipe_4:
+      name: "Recipe 4 Light Active"
+    light_recipe_5:
+      name: "Recipe 5 Light Active"
+    light_recipe_6:
+      name: "Recipe 6 Light Active"
+    light_recipe_7:
+      name: "Recipe 7 Light Active"
+    light_recipe_8:
+      name: "Recipe 8 Light Active"
+    flash_recipe_1:
+      name: "Recipe 1 Light Flashing"
+    flash_recipe_2:
+      name: "Recipe 2 Light Flashing"
+    flash_recipe_3:
+      name: "Recipe 3 Light Flashing"
+    flash_recipe_4:
+      name: "Recipe 4 Light Flashing"
+    flash_recipe_5:
+      name: "Recipe 5 Light Flashing"
+    flash_recipe_6:
+      name: "Recipe 6 Light Flashing"
+    flash_recipe_7:
+      name: "Recipe 7 Light Flashing"
+    flash_recipe_8:
+      name: "Recipe 8 Light Flashing"
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: debug
+    free:
+      name: "Heap Free"
+      entity_category: diagnostic
+    block:
+      name: "Heap Max Block"
+      entity_category: diagnostic
+    fragmentation:
+      name: "Heap Fragmentation"
+      entity_category: diagnostic
+    loop_time:
+      name: "Loop Time"
+      entity_category: diagnostic
+
+  - platform: jura
+    jura_id: jura_machine
+
+    # Mapped lifetime/service statistics. These also provide the authoritative
+    # completion proof for supported batch beverage operations.
+    lifetime_coffee:
+      name: "Lifetime Coffee"
+    lifetime_espresso:
+      name: "Lifetime Espresso"
+    lifetime_cappuccino:
+      name: "Lifetime Cappuccino"
+    lifetime_latte_macchiato:
+      name: "Lifetime Latte Macchiato"
+    lifetime_macchiato:
+      name: "Lifetime Macchiato"
+    lifetime_milk_froth:
+      name: "Lifetime Milk Froth"
+    lifetime_hot_water:
+      name: "Lifetime Hot Water"
+    lifetime_steam:
+      name: "Lifetime Steam"
+    lifetime_rinse:
+      name: "Lifetime Rinse"
+    lifetime_clean_cappu:
+      name: "Lifetime Clean Cappu"
+    lifetime_filter_changes:
+      name: "Lifetime Filter Changes"
+    lifetime_cleaning:
+      name: "Lifetime Cleaning Cycles"
+    lifetime_descaling:
+      name: "Lifetime Descaling Cycles"
+    lifetime_power_on:
+      name: "Lifetime Power On / Wake"
+
+    communication_errors:
+      name: "Jura Communication Errors"
+
+    # Keep only the two production RAM values visible; full state research uses
+    # the guided RAM/EEPROM experiment selected from the Operation dropdown.
+    ram_16:
+      name: "Power State Raw (RAM 0x16)"
+    ram_f0_f1:
+      name: "RAM F0-F1 Raw (Unmapped)"
+
+number:
+  # Resettable/user product counters remain writable configuration entities.
+  # Writes are RE -> WE -> RE verified by the component.
+  - platform: jura
+    jura_id: jura_machine
+    user_coffee:
+      name: "User Coffee Counter"
+    user_espresso:
+      name: "User Espresso Counter"
+    user_cappuccino:
+      name: "User Cappuccino Counter"
+    user_latte_macchiato:
+      name: "User Latte Macchiato Counter"
+    user_macchiato:
+      name: "User Macchiato Counter"
+    user_milk_froth:
+      name: "User Milk Froth Counter"
+    user_hot_water:
+      name: "User Hot Water Counter"
+    user_steam:
+      name: "User Steam Counter"
+
+    # EEPROM D4..FB is ten fixed 8-byte recipe/action slots. On ESP8266 we
+    # deliberately expose ONE recipe editor rather than 60 permanent slot-number
+    # entities. Operation selects the physical Recipe slot; edit the shared fields below.
+    # The component still caches all ten slots internally for batch execution and
+    # function remapping. Direct writes remain gated by Recipe EEPROM Writes.
+    recipe_editor_temperature:
+      name: "Recipe Editor Temperature"
+    recipe_editor_grinder_balance:
+      name: "Recipe Editor Grinder Balance"
+    recipe_editor_powder:
+      name: "Recipe Editor Powder Raw"
+    recipe_editor_water:
+      name: "Recipe Editor Water"
+    recipe_editor_milk:
+      name: "Recipe Editor Milk"
+    recipe_editor_froth:
+      name: "Recipe Editor Froth"
+
+  # Machine auto-off delay from EEPROM 0x26. The low byte is confirmed to be
+  # half-hour units (0=Disabled, 1=0.5 h, ... 18=9 h). The component preserves
+  # the high byte and verifies the write with RE -> WE -> RE.
+  - platform: template
+    id: jura_auto_off_delay
+    name: "Auto-Off Delay"
+    unit_of_measurement: "h"
+    icon: "mdi:timer-off-outline"
+    entity_category: config
+    mode: box
+    update_interval: 30s
+    min_value: 0
+    max_value: 9
+    step: 0.5
+    lambda: |-
+      if (!id(jura_machine).has_auto_off_setting())
+        return {};
+      return id(jura_machine).get_auto_off_hours();
+    set_action:
+      - lambda: |-
+          id(jura_machine).request_auto_off_hours(x);
+
+  # 0 disables time-based mapped-counter polling. Other allowed values are
+  # 5, 10, ... seconds. Restored after ESPHome reboot; default 30 seconds.
+  - platform: template
+    id: counter_poll_interval
+    name: "Counter Poll Interval"
+    unit_of_measurement: "s"
+    icon: "mdi:counter"
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    min_value: 0
+    max_value: 3600
+    step: 5
+    set_action:
+      - lambda: |-
+          id(jura_machine).set_eeprom_probe_interval_seconds(x);
+    on_value:
+      then:
+        - lambda: |-
+            id(jura_machine).set_eeprom_probe_interval_seconds(x);
+
+  # Additional delay after the lifetime counter proves one product completed
+  # before the next product in the same batch starts. 0 disables this extra
+  # delay. Product-specific minimum brew times remain enforced separately.
+  - platform: template
+    id: inter_product_delay
+    name: "Inter-Product Delay"
+    unit_of_measurement: "s"
+    icon: "mdi:timer-sand"
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 0
+    max_value: 3600
+    step: 1
+    set_action:
+      - lambda: |-
+          id(jura_machine).set_inter_product_delay_seconds(x);
+    on_value:
+      then:
+        - lambda: |-
+            id(jura_machine).set_inter_product_delay_seconds(x);
+
+  # Sliding UI timeout for Operation + Repeats. 0 disables reset.
+  - platform: template
+    id: operation_reset_timeout
+    name: "Operation Reset Timeout"
+    unit_of_measurement: "min"
+    icon: "mdi:timer-refresh-outline"
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 0
+    max_value: 1440
+    step: 1
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x <= 0.0f;'
+            then:
+              - script.stop: reset_operation_controls_timer
+            else:
+              - script.execute: reset_operation_controls_timer
+
+  # Independent timeout for a non-Default grinder override. 0 disables reset
+  # and therefore preserves the selected grinder indefinitely.
+  - platform: template
+    id: grinder_override_timeout
+    name: "Grinder Override Timeout"
+    unit_of_measurement: "min"
+    icon: "mdi:timer-cog-outline"
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 1440
+    step: 1
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x <= 0.0f;'
+            then:
+              - script.stop: reset_grinder_override_timer
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(jura_grinder).current_option() != "Default";'
+                  then:
+                    - script.execute: reset_grinder_override_timer
+
+  # Shared by both beverage batches and guided RAM/EEPROM experiments.
+  - platform: template
+    id: operation_repeats
+    name: "Operation Repeats"
+    icon: "mdi:repeat"
+    mode: box
+    optimistic: true
+    restore_value: false
+    initial_value: 1
+    min_value: 1
+    max_value: 20
+    step: 1
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(operation_reset_in_progress);'
+            then:
+              - script.execute: reset_operation_controls_timer
+
+  # Used only for the automatic time-series gap in Clock/Timer Mapping.
+  # RAM/EEPROM experiments are operator-paced with Continue Debug Operation.
+  # Diagnostic/disabled-by-default to keep the normal entity list small.
+  - platform: template
+    id: experiment_window
+    name: "Experiment Window"
+    internal: ${hide_debug_tools}
+    unit_of_measurement: "s"
+    icon: "mdi:timer-outline"
+    entity_category: diagnostic
+    disabled_by_default: true
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 1
+    max_value: 120
+    step: 1
+
+datetime:
+  # Jura stores scheduled times as one 16-bit EEPROM word: binary hour in the
+  # high byte and minute in the low byte. 0x8000 means unset/disabled. Editing
+  # either time directly enables that schedule; the separate switches can then
+  # disable/re-enable it.
+  - platform: template
+    id: jura_scheduled_power_on_time
+    type: time
+    name: "Scheduled Power On Time"
+    icon: "mdi:clock-start"
+    entity_category: config
+    update_interval: 30s
+    lambda: |-
+      uint8_t hour = 0;
+      uint8_t minute = 0;
+      if (!id(jura_machine).get_scheduled_power_time(true, hour, minute))
+        return {};
+      ESPTime value{};
+      value.hour = hour;
+      value.minute = minute;
+      value.second = 0;
+      return value;
+    set_action:
+      - lambda: |-
+          id(jura_machine).request_scheduled_power_time(true, x.hour, x.minute);
+
+  - platform: template
+    id: jura_scheduled_power_off_time
+    type: time
+    name: "Scheduled Power Off Time"
+    icon: "mdi:clock-end"
+    entity_category: config
+    update_interval: 30s
+    lambda: |-
+      uint8_t hour = 0;
+      uint8_t minute = 0;
+      if (!id(jura_machine).get_scheduled_power_time(false, hour, minute))
+        return {};
+      ESPTime value{};
+      value.hour = hour;
+      value.minute = minute;
+      value.second = 0;
+      return value;
+    set_action:
+      - lambda: |-
+          id(jura_machine).request_scheduled_power_time(false, x.hour, x.minute);
+
+select:
+  # Function/type is the high byte of each slot's first EEPROM word. State is
+  # read back from EEPROM; selecting a new value performs RE -> masked WE -> RE.
+  # 0x1A..0x1C are intentionally excluded because testing wedged Product Settings.
+  - platform: jura
+    jura_id: jura_machine
+    recipe_editor_function:
+      name: "Recipe Editor Function"
+    recipe_editor_preset:
+      name: "Recipe Editor Preset"
+    operation:
+      id: jura_operation
+      name: "Operation"
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(operation_reset_in_progress);'
+              then:
+                - script.execute: reset_operation_controls_timer
+
+  - platform: template
+    id: jura_debug_operation
+    name: "Debug Operation"
+    icon: "mdi:bug-outline"
+    entity_category: diagnostic
+    internal: ${hide_debug_tools}
+    optimistic: true
+    restore_value: false
+    initial_option: "Grinder Mapping"
+    options:
+      - "Grinder Mapping"
+      - "Clock/Timer Mapping"
+      - "Top-Level Menu RAM Discovery"
+      - "Menu Section RAM Discovery"
+      - "Full Menu RAM Discovery"
+      - "RAM Experiment"
+      - "EEPROM Experiment"
+      - "RAM Dump"
+      - "EEPROM Dump"
+
+
+  - platform: template
+    id: jura_menu_discovery_section
+    name: "Menu Discovery Section"
+    icon: "mdi:menu-open"
+    entity_category: diagnostic
+    internal: ${hide_debug_tools}
+    optimistic: true
+    restore_value: true
+    initial_option: "Water Hardness"
+    options:
+      - "Water Hardness"
+      - "Product Settings"
+      - "Product: Water"
+      - "Product: Froth"
+      - "Product: Milk"
+      - "Product: Powder"
+      - "Product: Grinder"
+      - "Product: Temperature"
+      - "Time"
+      - "Timer"
+      - "Timer: Unit On"
+      - "Timer: Machine Off"
+      - "Timer: Weekdays"
+      - "Off After"
+      - "Rinsing"
+      - "Language"
+      - "Display"
+      - "Information"
+
+  - platform: template
+    id: jura_grinder
+    name: "Grinder"
+    icon: "mdi:grain"
+    optimistic: true
+    restore_value: true
+    initial_option: "Default"
+    options:
+      - "Default"
+      - "Left"
+      - "Right (Decaf)"
+      - "Both"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x != "Default" && !id(jura_machine).has_grinder_selector_button();'
+            then:
+              - lambda: |-
+                  ESP_LOGW("jura", "GRINDER_UI: selection rejected because no recipe button is assigned Grinder Selector");
+                  id(grinder_reset_in_progress) = true;
+              - select.set:
+                  id: jura_grinder
+                  option: "Default"
+              - lambda: |-
+                  id(grinder_reset_in_progress) = false;
+            else:
+              - if:
+                  condition:
+                    lambda: 'return !id(grinder_reset_in_progress);'
+                  then:
+                    - if:
+                        condition:
+                          lambda: 'return x == "Default" || id(grinder_override_timeout).state <= 0.0f;'
+                        then:
+                          - script.stop: reset_grinder_override_timer
+                        else:
+                          - script.execute: reset_grinder_override_timer
+
+text:
+  # Raw protocol access is intentionally diagnostic, not configuration.
+  - platform: template
+    id: jura_raw_command
+    name: "Raw Jura Command"
+    internal: ${hide_debug_tools}
+    icon: "mdi:console-line"
+    entity_category: diagnostic
+    optimistic: true
+    restore_value: false
+    initial_value: ""
+    min_length: 0
+    max_length: 23
+    mode: text
+
+  # Operator-supplied observation captured at the next accepted Continue.
+  # Useful for values visible only on the Jura LCD (for example "40 mL",
+  # "bar 3/5", or lamp/button observations). The Continue button logs the
+  # text against the exact active discovery state and then clears this entity.
+  - platform: template
+    id: debug_operator_observation
+    name: "Debug Operator Observation"
+    internal: ${hide_debug_tools}
+    icon: "mdi:text-box-edit-outline"
+    entity_category: diagnostic
+    optimistic: true
+    restore_value: false
+    initial_value: ""
+    min_length: 0
+    max_length: 96
+    mode: text
+
+  # Optional physical cue for guided experiments. Hidden by default until a
+  # harmless beep-only command is positively identified.
+  - platform: template
+    id: debug_cue_command
+    name: "Debug Cue Command"
+    internal: ${hide_debug_tools}
+    icon: "mdi:bell-outline"
+    entity_category: diagnostic
+    disabled_by_default: true
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    min_length: 0
+    max_length: 23
+    mode: text
+
+text_sensor:
+  - platform: version
+    name: "ESPHome Version"
+    entity_category: diagnostic
+
+  - platform: debug
+    reset_reason:
+      name: "ESP Reset Reason"
+      entity_category: diagnostic
+
+  - platform: wifi_info
+    bssid:
+      name: "Connected BSSID"
+      entity_category: diagnostic
+    ssid:
+      name: "Connected SSID"
+      entity_category: diagnostic
+    power_save_mode:
+      name: "WiFi Power Save Mode"
+      entity_category: diagnostic
+
+  - platform: jura
+    jura_id: jura_machine
+    machine_type:
+      name: "Jura Machine Type"
+      entity_category: diagnostic
+    last_response:
+      name: "Jura Last Response"
+      entity_category: diagnostic
+    discovery_status:
+      name: "Operation Status"
+    eeprom_changes:
+      name: "Jura EEPROM Changes"
+      entity_category: diagnostic
+    ram_changes:
+      name: "Jura RAM Changes"
+      entity_category: diagnostic
+
+switch:
+  # State is non-optimistic and comes from RAM 0x16, not AN:01/AN:02 response.
+  - platform: jura
+    jura_id: jura_machine
+    power:
+      name: "Power"
+
+  # Safety gate for direct EEPROM recipe edits. Read-only recipe values continue
+  # to refresh while OFF. This intentionally resets OFF after every ESP reboot.
+  - platform: template
+    id: recipe_eeprom_writes
+    name: "Recipe EEPROM Writes"
+    icon: "mdi:database-edit-outline"
+    entity_category: config
+    restore_mode: ALWAYS_OFF
+    lambda: |-
+      return id(jura_machine).are_recipe_writes_enabled();
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).set_recipe_writes_enabled(true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).set_recipe_writes_enabled(false);
+
+  # Power-on/off clock enable state. EEPROM 0x25 and 0x28 use 0x8000 for
+  # disabled. Re-enabling restores the last time observed by this ESP boot, or
+  # 00:00 if the machine booted with the schedule unset and no prior time exists.
+  - platform: template
+    id: jura_scheduled_power_on
+    name: "Scheduled Power On"
+    icon: "mdi:power-on"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_scheduled_power_on_state())
+        return {};
+      return id(jura_machine).is_scheduled_power_on_enabled();
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_scheduled_power_enabled(true, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_scheduled_power_enabled(true, false);
+
+  - platform: template
+    id: jura_scheduled_power_off
+    name: "Scheduled Power Off"
+    icon: "mdi:power-off"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_scheduled_power_off_state())
+        return {};
+      return id(jura_machine).is_scheduled_power_off_enabled();
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_scheduled_power_enabled(false, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_scheduled_power_enabled(false, false);
+
+  # EEPROM 0x57 low bits 0..6 are confirmed Monday..Sunday power-on days.
+  # The component preserves the high byte and the currently unknown bit 7.
+  - platform: template
+    id: jura_power_on_monday
+    name: "Power On Monday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(0);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(0, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(0, false);
+
+  - platform: template
+    id: jura_power_on_tuesday
+    name: "Power On Tuesday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(1);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(1, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(1, false);
+
+  - platform: template
+    id: jura_power_on_wednesday
+    name: "Power On Wednesday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(2);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(2, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(2, false);
+
+  - platform: template
+    id: jura_power_on_thursday
+    name: "Power On Thursday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(3);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(3, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(3, false);
+
+  - platform: template
+    id: jura_power_on_friday
+    name: "Power On Friday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(4);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(4, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(4, false);
+
+  - platform: template
+    id: jura_power_on_saturday
+    name: "Power On Saturday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(5);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(5, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(5, false);
+
+  - platform: template
+    id: jura_power_on_sunday
+    name: "Power On Sunday"
+    icon: "mdi:calendar-check"
+    entity_category: config
+    lambda: |-
+      if (!id(jura_machine).has_power_on_days())
+        return {};
+      return id(jura_machine).get_power_on_day(6);
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(6, true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).request_power_on_day(6, false);
+
+  - platform: template
+    id: jura_automatic_traffic
+    name: "Automatic Jura Polling"
+    icon: "mdi:database-sync-outline"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: |-
+      return id(jura_machine).is_automatic_traffic_enabled();
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).set_automatic_traffic_enabled(true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).set_automatic_traffic_enabled(false);
+
+  - platform: template
+    id: jura_uart_tx_float
+    name: "UART TX Float"
+    icon: "mdi:connection"
+    entity_category: diagnostic
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return id(jura_machine).is_tx_floating();
+    turn_on_action:
+      - lambda: |-
+          id(jura_machine).set_tx_floating(true);
+    turn_off_action:
+      - lambda: |-
+          id(jura_machine).set_tx_floating(false);
+
+button:
+  # Direct physical recipe-slot buttons. Their function is whatever EEPROM
+  # currently assigns to that slot. Hidden from HA by default to avoid accidental
+  # brews; set expose_recipe_buttons: true if direct slot presses are desired.
+  - platform: jura
+    jura_id: jura_machine
+    expose_recipe_buttons: false
+    recipe_1:
+      name: "Press Recipe 1"
+    recipe_2:
+      name: "Press Recipe 2"
+    recipe_3:
+      name: "Press Recipe 3"
+    recipe_4:
+      name: "Press Recipe 4"
+    recipe_5:
+      name: "Press Recipe 5"
+    recipe_6:
+      name: "Press Recipe 6"
+    recipe_7:
+      name: "Press Recipe 7"
+    recipe_8:
+      name: "Press Recipe 8"
+    recipe_9:
+      name: "Press Recipe 9"
+    recipe_10:
+      name: "Press Recipe 10"
+    program_settings:
+      name: "Press Program"
+    exit:
+      name: "Press Exit"
+    minus:
+      name: "Press -"
+    plus:
+      name: "Press +"
+
+  - platform: template
+    id: start_operation
+    name: "Start Operation"
+    icon: "mdi:play"
+    on_press:
+      - script.execute: reset_operation_controls_timer
+      - if:
+          condition:
+            lambda: |-
+              return id(grinder_override_timeout).state > 0.0f &&
+                     id(jura_grinder).current_option() != "Default";
+          then:
+            - script.execute: reset_grinder_override_timer
+      - lambda: |-
+          const std::string operation = id(jura_operation).current_option();
+          const uint8_t repeats = static_cast<uint8_t>(id(operation_repeats).state);
+          bool started = false;
+          const auto operation_index = id(jura_operation).active_index();
+          if (operation_index.has_value() && operation_index.value() < 10) {
+            started = id(jura_machine).start_brew_recipe_slot(
+                static_cast<uint8_t>(operation_index.value() + 1U), repeats,
+                std::string(id(jura_grinder).current_option()));
+          } else if (operation == "Rinse") {
+            started = id(jura_machine).queue_named_command(::esphome::jura::JuraButtonType::RINSE);
+          } else if (operation == "Clean Coffee") {
+            started = id(jura_machine).queue_named_command(::esphome::jura::JuraButtonType::CLEAN_COFFEE);
+          } else if (operation == "Decalcifying") {
+            started = id(jura_machine).queue_named_command(::esphome::jura::JuraButtonType::DECALCIFY);
+          } else if (operation == "Clean Milk System") {
+            started = id(jura_machine).queue_named_command(::esphome::jura::JuraButtonType::CLEAN_MILK_SYSTEM);
+          } else {
+            started = id(jura_machine).start_brew_batch(
+                operation, repeats, std::string(id(jura_grinder).current_option()));
+          }
+          if (!started)
+            ESP_LOGW("jura", "OPERATION: request rejected operation=%s", operation.c_str());
+
+  - platform: template
+    id: start_debug_operation
+    name: "Start Debug Operation"
+    icon: "mdi:bug-play-outline"
+    entity_category: diagnostic
+    internal: ${hide_debug_tools}
+    on_press:
+      - lambda: |-
+          const std::string operation = id(jura_debug_operation).current_option();
+          const uint8_t repeats = static_cast<uint8_t>(id(operation_repeats).state);
+          const uint32_t window_ms = static_cast<uint32_t>(id(experiment_window).state * 1000.0f);
+          bool started = false;
+          if (operation == "Grinder Mapping") {
+            started = id(jura_machine).start_grinder_mapping(repeats);
+          } else if (operation == "Clock/Timer Mapping") {
+            started = id(jura_machine).start_clock_timer_mapping(repeats, window_ms);
+          } else if (operation == "Top-Level Menu RAM Discovery") {
+            started = id(jura_machine).start_menu_mapping(repeats);
+          } else if (operation == "Menu Section RAM Discovery" || operation == "Menu RAM Discovery") {
+            // "Menu RAM Discovery" is retained as a compatibility alias for
+            // mixed/older HA state, but is no longer shown in the selector.
+            started = id(jura_machine).start_menu_ram_discovery_section(
+                std::string(id(jura_menu_discovery_section).current_option()));
+          } else if (operation == "Full Menu RAM Discovery") {
+            started = id(jura_machine).start_full_menu_ram_discovery(repeats);
+          } else if (operation == "RAM Experiment") {
+            started = id(jura_machine).start_guided_debug(
+                false, repeats, id(debug_cue_command).state);
+          } else if (operation == "EEPROM Experiment") {
+            started = id(jura_machine).start_guided_debug(
+                true, repeats, id(debug_cue_command).state);
+          } else if (operation == "RAM Dump") {
+            started = id(jura_machine).start_discovery(::esphome::jura::JuraButtonType::RAM_DUMP);
+          } else if (operation == "EEPROM Dump") {
+            started = id(jura_machine).start_discovery(::esphome::jura::JuraButtonType::EEPROM_DUMP);
+          }
+          if (!started)
+            ESP_LOGW("jura", "DEBUG_OPERATION: request rejected operation=%s", operation.c_str());
+
+  - platform: template
+    id: continue_debug_operation
+    name: "Continue Debug Operation"
+    icon: "mdi:debug-step-over"
+    entity_category: diagnostic
+    internal: ${hide_debug_tools}
+    on_press:
+      - lambda: |-
+          const std::string observation = id(debug_operator_observation).state;
+          if (id(jura_machine).continue_debug_operation()) {
+            // continue_debug_operation() only sets the advance flag; the state
+            // machine has not moved yet, so this note is attached to the exact
+            // checkpoint the operator just confirmed.
+            id(jura_machine).log_operator_observation(observation);
+            // Clear only after an accepted Continue so a mistimed button press
+            // cannot discard an observation before it has been logged.
+            id(debug_operator_observation).publish_state("");
+          } else {
+            ESP_LOGW("jura", "DEBUG_OPERATION: Continue ignored; active debug operation is not waiting for operator input");
+          }
+
+  - platform: template
+    id: cancel_operation
+    name: "Cancel Operation"
+    icon: "mdi:stop-circle-outline"
+    on_press:
+      - lambda: |-
+          id(jura_machine).cancel_active_operation();
+
+  - platform: template
+    name: "Send Raw Jura Command"
+    icon: "mdi:send"
+    entity_category: diagnostic
+    internal: ${hide_debug_tools}
+    on_press:
+      - lambda: |-
+          const std::string command = id(jura_raw_command).state;
+          if (!id(jura_machine).queue_raw_command(command))
+            ESP_LOGW("jura", "RAW_COMMAND_EVENT: Home Assistant send request was rejected");
+
+  - platform: restart
+    name: "Restart ESPHome"
+    entity_category: diagnostic
+
+  - platform: safe_mode
+    name: "Restart in Safe Mode"
+    entity_category: diagnostic
